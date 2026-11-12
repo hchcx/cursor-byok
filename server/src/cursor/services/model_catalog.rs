@@ -1,22 +1,20 @@
-//! Publishes the configured model catalog to Cursor.
+//! Publishes only configured BYOK and plugin models to Cursor, without upstream catalogs.
 use axum::{
-    body::{Body, Bytes},
-    extract::{Extension, State},
-    http::{header, HeaderValue, Request, Response, StatusCode},
+    body::Body,
+    extract::State,
+    http::{header, HeaderValue, Response, StatusCode},
 };
-use bytes::{BufMut, BytesMut};
 use prost::Message;
 
 use crate::{
-    api::cursor::proxy::{self, CursorProxy},
     cursor::{protocol::proto::agent::v1 as agent, transport::TransportRegistry},
     model::{format_token_count, parse_token_count, ModelConfig},
     plugin::PluginModelDescriptor,
-    Error, Result,
+    Result,
 };
 
 #[derive(Clone, PartialEq, Message)]
-struct AvailableModelsAddition {
+struct AvailableModelsResponse {
     #[prost(string, repeated, tag = "1")]
     model_names: Vec<String>,
     #[prost(message, repeated, tag = "2")]
@@ -182,7 +180,7 @@ struct AvailableModelVendor {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct UsableModelsAddition {
+struct UsableModelsResponse {
     #[prost(message, repeated, tag = "1")]
     models: Vec<agent::ModelDetails>,
 }
@@ -246,24 +244,17 @@ fn context_options(context_window_tokens: Option<u64>) -> Vec<(String, String)> 
     contexts
 }
 
-pub async fn available_models(
-    State(registry): State<TransportRegistry>,
-    Extension(proxy): Extension<CursorProxy>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
+pub async fn available_models(State(registry): State<TransportRegistry>) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
-    let plugin_models = match registry.plugins() {
-        Some(plugins) => plugins.configured_models().await,
-        None => Vec::new(),
-    };
+    let plugin_models = configured_plugin_models(&registry).await;
     tracing::info!(
         model_count = models.len(),
         plugin_model_count = plugin_models.len(),
-        "appending BYOK models to Cursor AvailableModels"
+        "publishing BYOK-only models to Cursor AvailableModels"
     );
     let mut available_models = models.iter().map(available_model).collect::<Vec<_>>();
     available_models.extend(plugin_models.iter().map(available_plugin_model));
-    let local = AvailableModelsAddition {
+    let local = AvailableModelsResponse {
         model_names: models
             .iter()
             .map(|model| model.model_hash.clone())
@@ -272,31 +263,18 @@ pub async fn available_models(
         models: available_models,
     }
     .encode_to_vec();
-    match proxy::forward_buffered(&proxy, request).await {
-        Ok(upstream) => merge_response(upstream, local),
-        Err(error) => {
-            tracing::warn!(%error, "Cursor AvailableModels upstream unavailable; using local catalog");
-            Ok(local_response(local))
-        }
-    }
+    Ok(local_response(local))
 }
 
-pub async fn usable_models(
-    State(registry): State<TransportRegistry>,
-    Extension(proxy): Extension<CursorProxy>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
+pub async fn usable_models(State(registry): State<TransportRegistry>) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
-    let plugin_models = match registry.plugins() {
-        Some(plugins) => plugins.configured_models().await,
-        None => Vec::new(),
-    };
+    let plugin_models = configured_plugin_models(&registry).await;
     tracing::info!(
         model_count = models.len(),
         plugin_model_count = plugin_models.len(),
-        "appending BYOK models to Cursor GetUsableModels"
+        "publishing BYOK-only models to Cursor GetUsableModels"
     );
-    let local = UsableModelsAddition {
+    let local = UsableModelsResponse {
         models: models
             .iter()
             .map(usable_model)
@@ -304,13 +282,7 @@ pub async fn usable_models(
             .collect(),
     }
     .encode_to_vec();
-    match proxy::forward_buffered(&proxy, request).await {
-        Ok(upstream) => merge_response(upstream, local),
-        Err(error) => {
-            tracing::warn!(%error, "Cursor GetUsableModels upstream unavailable; using local catalog");
-            Ok(local_response(local))
-        }
-    }
+    Ok(local_response(local))
 }
 
 pub async fn default_model_for_cli(
@@ -401,28 +373,6 @@ fn default_model_nudge_response(
     }
 }
 
-fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<Response<Body>> {
-    if !upstream.status.is_success() {
-        tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
-        return Ok(local_response(extra));
-    }
-    let (framed, payload) = unary_payload(&upstream.body)?;
-    let body = if framed {
-        let mut merged = BytesMut::with_capacity(5 + payload.len() + extra.len());
-        merged.put_u8(0);
-        merged.put_u32((payload.len() + extra.len()) as u32);
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    } else {
-        let mut merged = BytesMut::with_capacity(payload.len() + extra.len());
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    };
-    Ok(upstream.with_body(body))
-}
-
 fn local_response(body: Vec<u8>) -> Response<Body> {
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
@@ -431,23 +381,6 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
         HeaderValue::from_static("application/proto"),
     );
     response
-}
-
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
-    if body.len() < 5 {
-        return Ok((false, body));
-    }
-    let flags = body[0];
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if length != body.len() - 5 {
-        return Ok((false, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot merge compressed or terminal model catalog frame: flags={flags}"
-        )));
-    }
-    Ok((true, &body[5..]))
 }
 
 fn available_model(model: &ModelConfig) -> AvailableModel {
