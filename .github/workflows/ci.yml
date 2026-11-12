@@ -14,6 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-config:
+    name: Release configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify desktop version files
+        run: node .github/scripts/desktop-version.mjs check
+      - name: Test release scripts
+        run: node --test .github/scripts/*.test.mjs
+
   rust:
     name: Rust (Linux)
     runs-on: ubuntu-22.04
